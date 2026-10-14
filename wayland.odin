@@ -47,88 +47,130 @@ connection_destroy :: proc(connection: Connection) {
 	delete(connection.free_ids)
 }
 
+// man cmsg(3)
+// man sendmsg(2)
+// man unix(7)
 CMsg_Hdr :: struct {
 	len:         uint,
 	level, type: i32,
 }
 
+// #define CMSG_ALIGN(len) ( ((len)+sizeof(long)-1) & ~(sizeof(long)-1) )
 CMSG_ALIGN :: #force_inline proc "contextless" (len: $T) -> T {
 	align :: int(size_of(uint) - 1)
 	return (len + align) & ~align
 }
 
+// #define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
 CMSG_LEN :: #force_inline proc "contextless" (data_len: int) -> int {
 	return size_of(CMsg_Hdr) + data_len
 }
 
+// #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + CMSG_ALIGN(len))
 CMSG_SPACE :: #force_inline proc "contextless" (data_len: $T) -> T {
 	return size_of(CMsg_Hdr) + CMSG_ALIGN(data_len)
 }
 
+CMSG_FIRSTHDR :: #force_inline proc "contextless" (mhdr: ^linux.Msg_Hdr) -> ^CMsg_Hdr {
+	if len(mhdr.control) >= size_of(CMsg_Hdr) {
+		return (^CMsg_Hdr)(raw_data(mhdr.control))
+	}
+	return nil
+}
 
-connection_flush :: proc(connection: ^Connection) {
-	if len(connection.buffer_out) == 0 && len(connection.fds_out) == 0 do return
+SCM_RIGHTS :: 1
+// Linux SCM_MAX_FD is 253, but Wayland messages are usually 0-3 within a frame
+MAX_FDS :: 28
+CMSG_SPACE_MAX_FDS ::
+	size_of(CMsg_Hdr) + ((MAX_FDS * size_of(linux.Fd) + size_of(uint) - 1) &~ (size_of(uint) - 1))
 
+connection_flush :: proc(connection: ^Connection) -> linux.Errno {
+	if len(connection.buffer_out) == 0 && len(connection.fds_out) == 0 do return .NONE
+
+	control_buf: [CMSG_SPACE_MAX_FDS]byte
 	control: []byte
 	if len(connection.fds_out) > 0 {
+		assert(len(connection.fds_out) <= MAX_FDS, "too many fds queed in one flush")
 		data := len(connection.fds_out) * size_of(linux.Fd)
 		space := CMSG_SPACE(data)
-		control_buf := make([]byte, space, context.temp_allocator)
 		control = control_buf[:space]
 
-		hdr      := cast(^CMsg_Hdr)raw_data(control)
-		hdr.len   = uint(CMSG_LEN(data))
-		hdr.level = i32(linux.SOL_SOCKET)
-		hdr.type  = 1
+		cmsghdr := cast(^CMsg_Hdr)raw_data(control)
+		cmsghdr.len = uint(CMSG_LEN(data))
+		cmsghdr.level = i32(linux.SOL_SOCKET)
+		cmsghdr.type = SCM_RIGHTS
 
 		copy(control[size_of(CMsg_Hdr):], slice.to_bytes(connection.fds_out[:]))
 	}
 
 	for len(connection.buffer_out) > 0 {
 		msg := linux.Msg_Hdr {
-			iov = {{
-				base = raw_data(connection.buffer_out),
-				len = len(connection.buffer_out)
-			}},
+			iov     = {{base = raw_data(connection.buffer_out), len = len(connection.buffer_out)}},
 			control = control,
 		}
 		n, errno := linux.sendmsg(connection.socket, &msg, {.NOSIGNAL})
 		if errno == .EINTR do continue
-		if errno == .EAGAIN do continue
-		assert(errno == .NONE)
+
+		// if errno == .EAGAIN do return 
+		if errno != .NONE do return errno
 		assert(n > 0)
-
-		msg.control = nil
+		control = nil
 		clear(&connection.fds_out)
-
 		rest := len(connection.buffer_out) - n
 		copy(connection.buffer_out[:], connection.buffer_out[n:])
 		resize(&connection.buffer_out, rest)
-	}
+  }
+  return .NONE
 }
 
-connection_poll :: proc(connection: ^Connection) {
+connection_poll :: proc(connection: ^Connection) -> linux.Errno {
+  // TODO!: make a better return type
 	copy(connection.buffer_in, connection.buffer_in[connection.start_in:connection.end_in])
-	connection.end_in   = connection.end_in - connection.start_in
+	connection.end_in = connection.end_in - connection.start_in
 	connection.start_in = 0
 
+	control_buf: [CMSG_SPACE_MAX_FDS]byte
 	msg: linux.Msg_Hdr = {
-		iov     = { transmute(linux.IO_Vec)connection.buffer_in[connection.end_in:], },
-		control = make([]byte, 16 + 8 * 4, context.temp_allocator),
+		iov     = {transmute(linux.IO_Vec)connection.buffer_in[connection.end_in:]},
+		control = control_buf[:],
 	}
-	hdr      := cast(^struct { len: u64, level, type: i32 })raw_data(msg.control)
-	hdr.len   = u64(len(msg.control))
-	hdr.level = i32(linux.SOL_SOCKET)
-	hdr.type  = 1
-	n, errno := linux.recvmsg(connection.socket, &msg, { .CMSG_CLOEXEC, .NOSIGNAL, })
-	if errno != nil {
-		return
+
+	for {
+		n, errno := linux.recvmsg(connection.socket, &msg, {.CMSG_CLOEXEC })
+		if errno == .EINTR do continue
+		if errno == .EAGAIN do return errno 
+		if errno != .NONE do return errno
+
+		// stream closed by compositor
+		if n == 0 do return .ECONNRESET
+
+		connection.end_in += n
+		break
 	}
-	connection.end_in += n
-	if len(msg.control) != 0 {
-		append(&connection.fds_in, ..slice.reinterpret([]linux.Fd, msg.control[size_of(hdr^):]))
+
+	if .CTRUNC in msg.flags do return .EMSGSIZE
+
+	// TODO!: add macro for NXTHDR to handle multiple fds in a single message
+	if hdr := CMSG_FIRSTHDR(&msg); hdr != nil {
+		if hdr.level != i32(linux.SOL_SOCKET) ||
+			 hdr.type != SCM_RIGHTS ||
+			 hdr.len < uint(CMSG_LEN(0)) ||
+			 hdr.len > uint(len(msg.control)) {
+				return .EINVAL
+			}
+
+		data_len := int(hdr.len) - size_of(CMsg_Hdr)
+		if data_len % size_of(linux.Fd) != 0 {
+			return .EINVAL
+		}
+
+		append(
+			&connection.fds_in,
+			..slice.reinterpret([]linux.Fd, msg.control[size_of(hdr^):][:data_len]),
+		)
 	}
-	assert(errno == .NONE || errno == .EAGAIN)
+
+	return .NONE
 }
 
 @(require_results)
